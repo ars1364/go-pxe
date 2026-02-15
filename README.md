@@ -161,6 +161,57 @@ sudo ./go-pxe \
 - **Client:** macOS (Apple Silicon M3 Pro) with USB Ethernet adapter (AX88179B)
 - **OS:** Ubuntu 24.04.4 LTS Server
 
+## Internet Access for the Target Server
+
+The PXE-booted server only has a direct link to your machine — no internet by default. To share your internet connection (e.g., Wi-Fi) with the target server, enable NAT forwarding:
+
+### macOS
+
+```bash
+# Enable IP forwarding
+sudo sysctl -w net.inet.ip.forwarding=1
+
+# Enable NAT (replace en0 with your internet-facing interface, e.g., Wi-Fi)
+echo 'nat on en0 from 10.0.0.0/24 to any -> (en0)' | sudo pfctl -ef -
+```
+
+To verify:
+
+```bash
+# On the target server
+ping 8.8.8.8
+```
+
+To disable when done:
+
+```bash
+sudo sysctl -w net.inet.ip.forwarding=0
+sudo pfctl -d
+```
+
+> **Note:** On macOS, `pfctl -ef -` replaces the active packet filter ruleset. If you use a VPN that manages pf rules (e.g., Windscribe), you may need to restore its rules afterward.
+
+### Linux
+
+```bash
+# Enable IP forwarding
+sudo sysctl -w net.ip.ip_forward=1
+
+# Enable NAT (replace eth0 with your internet-facing interface)
+sudo iptables -t nat -A POSTROUTING -s 10.0.0.0/24 -o eth0 -j MASQUERADE
+sudo iptables -A FORWARD -i eth0 -o eth1 -m state --state RELATED,ESTABLISHED -j ACCEPT
+sudo iptables -A FORWARD -i eth1 -o eth0 -j ACCEPT
+```
+
+### DNS
+
+The go-pxe DHCP server advertises the PXE server IP (10.0.0.1) as the DNS server. If you are using dnsmasq alongside go-pxe, it will forward DNS queries automatically. Otherwise, configure a DNS forwarder on 10.0.0.1, or set a public DNS on the target server:
+
+```bash
+# On the target server
+echo "nameserver 8.8.8.8" > /etc/resolv.conf
+```
+
 ## Troubleshooting
 
 ### Client keeps sending DHCP DISCOVERs
