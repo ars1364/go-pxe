@@ -6,6 +6,7 @@ import (
 	"log"
 	"net"
 	"sync"
+	"syscall"
 )
 
 // DHCP message types
@@ -114,7 +115,7 @@ func (s *Server) allocateIP(mac net.HardwareAddr) net.IP {
 
 // ListenAndServe starts the DHCP server on port 67
 func (s *Server) ListenAndServe() error {
-	// Bind to the specific interface address for reliable broadcast on macOS
+	// Listen on 0.0.0.0:67 to receive broadcast DISCOVERs from all interfaces
 	addr := &net.UDPAddr{IP: net.IPv4zero, Port: 67}
 	conn, err := net.ListenUDP("udp4", addr)
 	if err != nil {
@@ -122,7 +123,53 @@ func (s *Server) ListenAndServe() error {
 	}
 	defer conn.Close()
 
+	// Create a dedicated send socket pinned to the PXE interface.
+	//
+	// Problem: On macOS (and some BSDs), a UDP socket bound to 0.0.0.0 sends
+	// broadcast replies via the default-route interface (e.g. Wi-Fi), NOT the
+	// PXE interface. Binding to the server IP alone is insufficient — macOS
+	// still routes 255.255.255.255 through the default gateway's interface.
+	//
+	// Solution: Use IP_BOUND_IF (syscall 25 on Darwin) to pin the send socket
+	// to the specific interface index. This forces ALL outbound packets —
+	// including broadcasts — through the correct physical interface.
+	sendAddr := &net.UDPAddr{IP: s.config.ServerIP, Port: 0}
+	sendConn, err := net.ListenUDP("udp4", sendAddr)
+	if err != nil {
+		return fmt.Errorf("DHCP send socket: %w", err)
+	}
+	defer sendConn.Close()
+
+	ifi, err := net.InterfaceByName(s.config.Interface)
+	if err != nil {
+		return fmt.Errorf("interface lookup %s: %w", s.config.Interface, err)
+	}
+
+	rawConn, err := sendConn.SyscallConn()
+	if err != nil {
+		return fmt.Errorf("syscall conn: %w", err)
+	}
+	var sockErr error
+	rawConn.Control(func(fd uintptr) {
+		// SO_BROADCAST: allow sending to broadcast addresses
+		if err := syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_BROADCAST, 1); err != nil {
+			sockErr = fmt.Errorf("SO_BROADCAST: %w", err)
+			return
+		}
+		// IP_BOUND_IF (25 on Darwin): pin socket to interface by index
+		// This is the macOS equivalent of Linux's SO_BINDTODEVICE
+		const IP_BOUND_IF = 25
+		if err := syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IP, IP_BOUND_IF, ifi.Index); err != nil {
+			sockErr = fmt.Errorf("IP_BOUND_IF: %w", err)
+			return
+		}
+	})
+	if sockErr != nil {
+		return fmt.Errorf("send socket options: %w", sockErr)
+	}
+
 	log.Printf("[DHCP] Listening on :67 (interface %s, server %s)", s.config.Interface, s.config.ServerIP)
+	log.Printf("[DHCP] Send socket bound to %s, pinned to %s (index %d) via IP_BOUND_IF", s.config.ServerIP, ifi.Name, ifi.Index)
 
 	buf := make([]byte, 1500)
 	for {
@@ -146,10 +193,10 @@ func (s *Server) ListenAndServe() error {
 		switch msgType[0] {
 		case DISCOVER:
 			log.Printf("[DHCP] DISCOVER from %s", pkt.CHAddr)
-			s.sendOffer(conn, pkt, remote)
+			s.sendOffer(sendConn, pkt, remote)
 		case REQUEST:
 			log.Printf("[DHCP] REQUEST from %s", pkt.CHAddr)
-			s.sendACK(conn, pkt, remote)
+			s.sendACK(sendConn, pkt, remote)
 		default:
 			log.Printf("[DHCP] Type %d from %s", msgType[0], pkt.CHAddr)
 		}
