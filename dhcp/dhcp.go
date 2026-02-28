@@ -115,7 +115,8 @@ func (s *Server) allocateIP(mac net.HardwareAddr) net.IP {
 
 // ListenAndServe starts the DHCP server on port 67
 func (s *Server) ListenAndServe() error {
-	// Listen on 0.0.0.0:67 to receive broadcast DISCOVERs from all interfaces
+	// Listen on 0.0.0.0:67 to receive broadcast DISCOVERs.
+	// Replies go out from port 67 (same socket) — PXE clients reject non-67 source.
 	addr := &net.UDPAddr{IP: net.IPv4zero, Port: 67}
 	conn, err := net.ListenUDP("udp4", addr)
 	if err != nil {
@@ -123,29 +124,13 @@ func (s *Server) ListenAndServe() error {
 	}
 	defer conn.Close()
 
-	// Create a dedicated send socket pinned to the PXE interface.
-	//
-	// Problem: On macOS (and some BSDs), a UDP socket bound to 0.0.0.0 sends
-	// broadcast replies via the default-route interface (e.g. Wi-Fi), NOT the
-	// PXE interface. Binding to the server IP alone is insufficient — macOS
-	// still routes 255.255.255.255 through the default gateway's interface.
-	//
-	// Solution: Use IP_BOUND_IF (syscall 25 on Darwin) to pin the send socket
-	// to the specific interface index. This forces ALL outbound packets —
-	// including broadcasts — through the correct physical interface.
-	sendAddr := &net.UDPAddr{IP: s.config.ServerIP, Port: 0}
-	sendConn, err := net.ListenUDP("udp4", sendAddr)
-	if err != nil {
-		return fmt.Errorf("DHCP send socket: %w", err)
-	}
-	defer sendConn.Close()
-
 	ifi, err := net.InterfaceByName(s.config.Interface)
 	if err != nil {
 		return fmt.Errorf("interface lookup %s: %w", s.config.Interface, err)
 	}
 
-	rawConn, err := sendConn.SyscallConn()
+	// Pin the socket to the PXE interface and enable broadcast.
+	rawConn, err := conn.SyscallConn()
 	if err != nil {
 		return fmt.Errorf("syscall conn: %w", err)
 	}
@@ -157,7 +142,6 @@ func (s *Server) ListenAndServe() error {
 			return
 		}
 		// IP_BOUND_IF (25 on Darwin): pin socket to interface by index
-		// This is the macOS equivalent of Linux's SO_BINDTODEVICE
 		const IP_BOUND_IF = 25
 		if err := syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IP, IP_BOUND_IF, ifi.Index); err != nil {
 			sockErr = fmt.Errorf("IP_BOUND_IF: %w", err)
@@ -168,8 +152,7 @@ func (s *Server) ListenAndServe() error {
 		return fmt.Errorf("send socket options: %w", sockErr)
 	}
 
-	log.Printf("[DHCP] Listening on :67 (interface %s, server %s)", s.config.Interface, s.config.ServerIP)
-	log.Printf("[DHCP] Send socket bound to %s, pinned to %s (index %d) via IP_BOUND_IF", s.config.ServerIP, ifi.Name, ifi.Index)
+	log.Printf("[DHCP] Listening on %s:67 (interface %s, pinned via IP_BOUND_IF index %d)", s.config.ServerIP, ifi.Name, ifi.Index)
 
 	buf := make([]byte, 1500)
 	for {
@@ -193,10 +176,10 @@ func (s *Server) ListenAndServe() error {
 		switch msgType[0] {
 		case DISCOVER:
 			log.Printf("[DHCP] DISCOVER from %s", pkt.CHAddr)
-			s.sendOffer(sendConn, pkt, remote)
+			s.sendOffer(conn, pkt, remote)
 		case REQUEST:
 			log.Printf("[DHCP] REQUEST from %s", pkt.CHAddr)
-			s.sendACK(sendConn, pkt, remote)
+			s.sendACK(conn, pkt, remote)
 		default:
 			log.Printf("[DHCP] Type %d from %s", msgType[0], pkt.CHAddr)
 		}
@@ -225,12 +208,17 @@ func (s *Server) sendReply(conn *net.UDPConn, req *Packet, msgType byte, clientI
 		}
 	}
 
+	// PXE Vendor Options (Option 43):
+	// Sub-option 6 (PXE_DISCOVERY_CONTROL) = 0x08: skip discovery, use boot file from DHCP
+	// Sub-option 255 (END)
+	pxeVendorOpts := []byte{6, 1, 0x08, 255}
+
 	reply := &Packet{
 		Op:     2, // BOOTREPLY
 		HType:  1,
 		HLen:   6,
 		XID:    req.XID,
-		Flags:  req.Flags,
+		Flags:  req.Flags | 0x8000, // Force broadcast flag
 		YIAddr: clientIP.To4(),
 		SIAddr: s.config.ServerIP.To4(),
 		CHAddr: req.CHAddr,
@@ -243,6 +231,8 @@ func (s *Server) sendReply(conn *net.UDPConn, req *Packet, msgType byte, clientI
 			OptLeaseTime:   {0, 0, 0x0E, 0x10}, // 3600 seconds
 			OptBootFile:    []byte(bootFile),
 			OptTFTPServer:  []byte(s.config.TFTPServer),
+			43:             pxeVendorOpts, // PXE vendor-specific: skip discovery
+			60:             []byte("PXEClient"), // Vendor class identifier
 		},
 	}
 
@@ -375,6 +365,13 @@ func serializePacket(p *Packet) []byte {
 		i += 2 + len(data)
 	}
 	buf[i] = OptEnd
+	i++
 
-	return buf[:i+1]
+	// Pad to minimum 548 bytes (BOOTP minimum).
+	// Many PXE ROMs silently reject shorter packets.
+	if i < 548 {
+		i = 548
+	}
+
+	return buf[:i]
 }
