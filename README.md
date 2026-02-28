@@ -1,233 +1,247 @@
-# go-pxe
+# Go PXE Boot Server
 
-A self-contained PXE boot server written in Go. Zero external dependencies — DHCP, TFTP, and HTTP servers are all built-in.
+Self-contained PXE boot server for macOS: DHCP + TFTP + HTTP in a single binary.
 
-Designed for bare-metal server provisioning over a direct Ethernet connection (e.g., laptop to server).
+> **Note:** The Go DHCP implementation has a known issue with HPE Gen9 (and possibly other) UEFI PXE ROMs that reject its OFFER packets. Use **dnsmasq** for production PXE boots (see below). The Go binary is useful for environments where dnsmasq is not available.
 
-## Features
+## What Actually Works: dnsmasq + HTTP
 
-- **DHCP Server** — Assigns IPs and advertises PXE boot parameters (UEFI and Legacy BIOS)
-- **TFTP Server** — Serves bootloader (GRUB EFI), kernel, and initrd
-- **HTTP Server** — Serves OS installation ISO for the installer to fetch
-- **Zero Dependencies** — Single binary, no dnsmasq/tftpd/nginx required
-- **Cross-Platform** — Runs on macOS, Linux, Windows (anywhere Go compiles)
+This is the tested, working method for PXE booting HPE Gen9 servers from macOS.
 
-## Quick Start
-
-### 1. Build
+### Prerequisites
 
 ```bash
-go build -o go-pxe .
+# Install dnsmasq (if not already installed)
+brew install dnsmasq
+
+# Python 3 (for HTTP server, comes with macOS)
+python3 --version
 ```
 
-### 2. Prepare Boot Files
-
-Create the directory structure:
+### Directory Structure
 
 ```
-./tftp/
-  grubx64.efi          # UEFI bootloader (from Ubuntu grub-efi-amd64-signed package)
-  vmlinuz              # Linux kernel (from ISO casper/vmlinuz)
-  initrd               # Initial ramdisk (from ISO casper/initrd)
-  grub/
-    grub.cfg           # GRUB configuration
-
-./http/
-  ubuntu-24.04.4-live-server-amd64.iso   # OS installation ISO
+pxeboot/
+├── tftp/
+│   ├── grubx64.efi          # UEFI GRUB bootloader
+│   ├── vmlinuz               # Linux kernel (from target distro)
+│   ├── initrd                # initramfs (from target distro)
+│   └── grub/
+│       └── grub.cfg          # GRUB boot menu
+└── http/
+    └── <ISO or disk image>   # OS installer or disk image
 ```
 
-#### Extract boot files from Ubuntu ISO:
+### Step-by-Step
+
+#### 1. Connect Hardware
+
+- Connect Mac to target server via Ethernet (direct cable or same switch)
+- Identify your Ethernet interface:
 
 ```bash
-# Install p7zip if needed
-brew install p7zip   # macOS
-apt install p7zip    # Linux
-
-# Extract kernel and initrd
-cd tftp
-7z e /path/to/ubuntu-24.04.4-live-server-amd64.iso casper/vmlinuz casper/initrd -y
-
-# Get GRUB EFI bootloader
-# From Ubuntu's grub-efi-amd64-signed package:
-curl -sLO "http://archive.ubuntu.com/ubuntu/pool/main/g/grub2-signed/grub-efi-amd64-signed_1.214+2.14~git20250718.0e36779-1ubuntu4_amd64.deb"
-ar x grub-efi-amd64-signed_*.deb
-zstd -d data.tar.zst && tar xf data.tar
-cp usr/lib/grub/x86_64-efi-signed/grubnetx64.efi.signed grubx64.efi
-rm -rf usr debian-binary control.tar.* data.tar* grub-efi-amd64-signed_*.deb
+networksetup -listallhardwareports
+# Look for "Thunderbolt Ethernet" or "USB 10/100/1000 LAN" — note the Device (e.g., en7)
 ```
 
-#### Create GRUB config:
+#### 2. Set Static IP on Ethernet Interface
 
 ```bash
-mkdir -p tftp/grub
-cat > tftp/grub/grub.cfg << 'EOF'
+sudo ifconfig en7 10.0.0.1 netmask 255.255.255.0 up
+# Verify:
+ifconfig en7 | grep inet
+# Should show: inet 10.0.0.1 netmask 0xffffff00 broadcast 10.0.0.255
+```
+
+#### 3. Prepare Boot Assets
+
+**For Ubuntu 24.04:**
+
+```bash
+cd /path/to/pxeboot
+
+# Download ISO (if not already present)
+curl -LO https://releases.ubuntu.com/24.04.4/ubuntu-24.04.4-live-server-amd64.iso
+mv ubuntu-24.04.4-live-server-amd64.iso http/
+
+# Extract kernel and initrd from ISO
+mkdir -p /tmp/ubuntu-mount
+hdiutil attach http/ubuntu-24.04.4-live-server-amd64.iso -mountpoint /tmp/ubuntu-mount
+cp /tmp/ubuntu-mount/casper/vmlinuz tftp/vmlinuz
+cp /tmp/ubuntu-mount/casper/initrd tftp/initrd
+hdiutil detach /tmp/ubuntu-mount
+```
+
+**For AlmaLinux/RHEL (boot ISO):**
+
+```bash
+curl -LO https://repo.almalinux.org/almalinux/9/isos/x86_64/AlmaLinux-9-latest-x86_64-boot.iso
+mv AlmaLinux-9-latest-x86_64-boot.iso http/
+
+mkdir -p /tmp/alma-mount
+hdiutil attach http/AlmaLinux-9-latest-x86_64-boot.iso -mountpoint /tmp/alma-mount
+cp /tmp/alma-mount/images/pxeboot/vmlinuz tftp/vmlinuz
+cp /tmp/alma-mount/images/pxeboot/initrd.img tftp/initrd
+hdiutil detach /tmp/alma-mount
+```
+
+**Get GRUB EFI bootloader** (if not already present):
+
+```bash
+# From an existing Ubuntu system, or extract from the ISO:
+# The grubx64.efi in this repo should work for most UEFI systems.
+ls tftp/grubx64.efi
+```
+
+#### 4. Configure GRUB Menu
+
+Edit `tftp/grub/grub.cfg`:
+
+**For Ubuntu live/rescue shell:**
+```
 set timeout=30
 set default=0
 
-menuentry "Install Ubuntu 24.04.4 Server" {
-    linux vmlinuz ip=dhcp url=http://10.0.0.1:8080/ubuntu-24.04.4-live-server-amd64.iso autoinstall
-    initrd initrd
-}
-
-menuentry "Install Ubuntu 24.04.4 Server (safe graphics)" {
-    linux vmlinuz ip=dhcp url=http://10.0.0.1:8080/ubuntu-24.04.4-live-server-amd64.iso autoinstall nomodeset
+menuentry "Ubuntu 24.04 Live" {
+    linux vmlinuz ip=dhcp url=http://10.0.0.1:8080/ubuntu-24.04.4-live-server-amd64.iso
     initrd initrd
 }
 
 menuentry "Boot from local disk" {
     exit
 }
-EOF
 ```
 
-### 3. Connect & Configure Network
+**For AlmaLinux network install:**
+```
+set timeout=30
+set default=0
 
-Connect your machine to the target server via Ethernet (direct cable or switch).
+menuentry "Install AlmaLinux 9" {
+    linux vmlinuz ip=dhcp inst.repo=https://repo.almalinux.org/almalinux/9/BaseOS/x86_64/os/
+    initrd initrd
+}
 
-Assign a static IP to the interface:
+menuentry "Boot from local disk" {
+    exit
+}
+```
+
+#### 5. Start HTTP Server
 
 ```bash
-# macOS (replace en7 with your interface)
-networksetup -setmanual "AX88179B" 10.0.0.1 255.255.255.0
-
-# Linux
-sudo ip addr add 10.0.0.1/24 dev eth0
-sudo ip link set eth0 up
+cd /path/to/pxeboot/http
+python3 -m http.server 8080 &
 ```
 
-### 4. Run
+#### 6. Start dnsmasq (PXE DHCP + TFTP)
 
 ```bash
-sudo ./go-pxe \
-  --iface en7 \
-  --ip 10.0.0.1 \
-  --tftp-root ./tftp \
-  --http-root ./http
+sudo dnsmasq \
+  --no-daemon \
+  --interface=en7 \
+  --bind-interfaces \
+  --dhcp-range=10.0.0.100,10.0.0.200,255.255.255.0,1h \
+  --dhcp-option=option:router,10.0.0.1 \
+  --dhcp-boot=grubx64.efi \
+  --dhcp-match=set:efi-x86_64,option:client-arch,7 \
+  --dhcp-match=set:efi-x86_64,option:client-arch,9 \
+  --dhcp-boot=tag:efi-x86_64,grubx64.efi \
+  --enable-tftp \
+  --tftp-root=/path/to/pxeboot/tftp \
+  --log-dhcp \
+  --log-queries
 ```
 
-> **Note:** Requires root/sudo for DHCP (port 67) and TFTP (port 69).
+> Replace `en7` with your Ethernet interface and paths accordingly.
 
-### 5. Boot the Server
+#### 7. Boot the Target Server
 
-1. Power on the target server
-2. Press **F12** (or enter BIOS) for one-time network boot
-3. Ensure **UEFI mode** is enabled
-4. Select the network adapter connected to your machine
-5. GRUB menu appears → select "Install Ubuntu"
-6. The installer downloads the ISO via HTTP and proceeds normally
+1. Power on the server
+2. Press **F12** (or F11) for the boot menu
+3. Select **Network Boot** / **PXE** (UEFI mode)
+4. The server will:
+   - DHCP → get IP from dnsmasq
+   - TFTP → download `grubx64.efi`
+   - GRUB → load `grub.cfg`, show boot menu
+   - Download `vmlinuz` + `initrd` via TFTP
+   - Boot the kernel, which downloads the ISO via HTTP
 
-## Command-Line Options
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--iface` | `en7` | Network interface to listen on |
-| `--ip` | `10.0.0.1` | Server IP address |
-| `--dhcp-start` | `10.0.0.100` | DHCP range start |
-| `--dhcp-end` | `10.0.0.200` | DHCP range end |
-| `--tftp-root` | `./tftp` | TFTP root directory |
-| `--http-root` | `./http` | HTTP root directory |
-| `--http-port` | `8080` | HTTP server port |
-| `--boot-file` | `bootx64.efi` | PXE boot filename (UEFI) |
-
-## Architecture
+### Expected dnsmasq Log Output
 
 ```
-┌─────────────┐                    ┌──────────────┐
-│  PXE Client │──── DHCP ────────▶│  go-pxe      │
-│  (Server)   │◀─── IP + Boot ───│              │
-│             │                    │  DHCP :67    │
-│             │──── TFTP ────────▶│  TFTP :69    │
-│             │◀─── grubx64.efi ──│  HTTP :8080  │
-│             │◀─── vmlinuz ──────│              │
-│             │◀─── initrd ───────│              │
-│             │                    │              │
-│             │──── HTTP ────────▶│              │
-│             │◀─── ISO (3.2GB) ──│              │
-└─────────────┘                    └──────────────┘
+dnsmasq-dhcp: DHCPDISCOVER(en7) 20:67:7c:e5:54:ec
+dnsmasq-dhcp: DHCPOFFER(en7) 10.0.0.198 20:67:7c:e5:54:ec
+dnsmasq-dhcp: DHCPREQUEST(en7) 10.0.0.198 20:67:7c:e5:54:ec
+dnsmasq-dhcp: DHCPACK(en7) 10.0.0.198 20:67:7c:e5:54:ec
+dnsmasq-tftp: sent grubx64.efi to 10.0.0.198
+dnsmasq-tftp: sent grub/grub.cfg to 10.0.0.198
+dnsmasq-tftp: sent vmlinuz to 10.0.0.198
+dnsmasq-tftp: sent initrd to 10.0.0.198
 ```
 
-## PXE Boot Flow
+## Writing a Disk Image to Server
 
-1. **DHCP DISCOVER** — Client broadcasts looking for a DHCP server
-2. **DHCP OFFER** — Server offers IP + boot parameters (TFTP server, boot file)
-3. **DHCP REQUEST/ACK** — Client accepts the offer
-4. **TFTP** — Client downloads `grubx64.efi` (UEFI bootloader)
-5. **TFTP** — GRUB downloads `grub.cfg`, `vmlinuz`, `initrd`
-6. **HTTP** — Kernel fetches the full ISO for installation
+If you have a pre-built disk image (e.g., `almalinux.img`), PXE boot a live Ubuntu, then:
 
-## Tested With
+```bash
+# From the PXE-booted Ubuntu shell on the target server:
 
-- **Server:** HPE ProLiant DL360 Gen9 (UEFI, HP 331i 1Gb NIC)
-- **Client:** macOS (Apple Silicon M3 Pro) with USB Ethernet adapter (AX88179B)
-- **OS:** Ubuntu 24.04.4 LTS Server
+# Find the target disk
+lsblk
 
-## Internet Access for the Target Server
+# Write the disk image over HTTP (10.0.0.1 = your Mac)
+curl http://10.0.0.1:8080/almalinux.img | dd of=/dev/sda bs=4M status=progress
 
-The PXE-booted server only has a direct link to your machine — no internet by default. To share your internet connection (e.g., Wi-Fi) with the target server, enable NAT forwarding:
+# Reboot into the new OS
+reboot
+```
 
-### macOS
+## Internet Sharing (Post-Install)
+
+To give the PXE-booted server internet access through your Mac:
 
 ```bash
 # Enable IP forwarding
 sudo sysctl -w net.inet.ip.forwarding=1
 
-# Enable NAT (replace en0 with your internet-facing interface, e.g., Wi-Fi)
-echo 'nat on en0 from 10.0.0.0/24 to any -> (en0)' | sudo pfctl -ef -
-```
-
-To verify:
-
-```bash
-# On the target server
-ping 8.8.8.8
-```
-
-To disable when done:
-
-```bash
-sudo sysctl -w net.inet.ip.forwarding=0
-sudo pfctl -d
-```
-
-> **Note:** On macOS, `pfctl -ef -` replaces the active packet filter ruleset. If you use a VPN that manages pf rules (e.g., Windscribe), you may need to restore its rules afterward.
-
-### Linux
-
-```bash
-# Enable IP forwarding
-sudo sysctl -w net.ip.ip_forward=1
-
-# Enable NAT (replace eth0 with your internet-facing interface)
-sudo iptables -t nat -A POSTROUTING -s 10.0.0.0/24 -o eth0 -j MASQUERADE
-sudo iptables -A FORWARD -i eth0 -o eth1 -m state --state RELATED,ESTABLISHED -j ACCEPT
-sudo iptables -A FORWARD -i eth1 -o eth0 -j ACCEPT
-```
-
-### DNS
-
-The go-pxe DHCP server advertises the PXE server IP (10.0.0.1) as the DNS server. If you are using dnsmasq alongside go-pxe, it will forward DNS queries automatically. Otherwise, configure a DNS forwarder on 10.0.0.1, or set a public DNS on the target server:
-
-```bash
-# On the target server
-echo "nameserver 8.8.8.8" > /etc/resolv.conf
+# NAT via your Mac's internet interface (e.g., en0 = Wi-Fi)
+echo "nat on en0 from 10.0.0.0/24 to any -> (en0)" | sudo pfctl -ef -
 ```
 
 ## Troubleshooting
 
-### Client keeps sending DHCP DISCOVERs
-- Check that the Ethernet link is up (`status: active` in `ifconfig`)
-- Ensure no other DHCP server is on the network
-- On macOS, the server uses subnet broadcast (10.0.0.255) for reliability
+| Problem | Solution |
+|---------|----------|
+| DISCOVER loops (no REQUEST) | Use dnsmasq instead of go-pxe. HPE UEFI PXE ROMs are strict about DHCP packet format. |
+| TFTP "User aborted" then succeeds | Normal — PXE ROM retries on first TFTP error. |
+| GRUB shows "file not found" for `.lst` files | Non-fatal. GRUB modules `command.lst`, `fs.lst`, etc. are optional. |
+| Server doesn't PXE boot | Check BIOS: must be UEFI mode, network boot enabled. |
+| "No bootable device" | Verify Ethernet link is up: `ifconfig en7` should show `RUNNING`. |
+| TFTP timeout | Check macOS firewall is disabled: `sudo /usr/libexec/ApplicationFirewall/socketfilterfw --getglobalstate` |
 
-### GRUB shows "file not found"
-- Verify `grubx64.efi` is in the TFTP root
-- Check that `grub/grub.cfg` exists relative to TFTP root
-- GRUB module files (command.lst, fs.lst) missing is non-fatal
+## Go PXE Binary (Experimental)
 
-### ISO download fails during install
-- Ensure the HTTP server is running and the ISO path matches `grub.cfg`
-- Check that the ISO filename in `grub.cfg` matches the actual file
+The Go binary (`go-pxe`) combines DHCP + TFTP + HTTP but has a known DHCP compatibility issue with strict PXE ROMs. It works with some clients but not HPE Gen9 UEFI.
 
-## License
+```bash
+cd go-pxe
+go build -o go-pxe .
+sudo ./go-pxe \
+  -iface en7 \
+  -ip 10.0.0.1 \
+  -dhcp-start 10.0.0.100 \
+  -dhcp-end 10.0.0.200 \
+  -tftp-root ../tftp \
+  -http-root ../http \
+  -http-port 8080 \
+  -boot-file grubx64.efi
+```
 
-MIT
+## Lessons Learned
+
+1. **HPE Gen9 UEFI PXE is extremely strict** about DHCP packet format. dnsmasq handles all the edge cases.
+2. **macOS broadcast routing**: Outbound UDP broadcasts go through the default-route interface (Wi-Fi), not necessarily the Ethernet. Use `IP_BOUND_IF` or dnsmasq's `--bind-interfaces` to pin to the correct interface.
+3. **BOOTP minimum packet size**: Some PXE ROMs reject DHCP packets smaller than 548 bytes.
+4. **DHCP source port**: PXE ROMs reject replies not from port 67.
+5. **Pre-installed disk images are not PXE-bootable**: An `.img` file of an installed OS cannot be PXE booted directly. PXE boot a live OS first, then `dd` the image to disk.
