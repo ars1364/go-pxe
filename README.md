@@ -22,14 +22,18 @@ python3 --version
 
 ```
 pxeboot/
+├── dnsmasq.conf                              # Production DHCP/TFTP config
 ├── tftp/
-│   ├── grubx64.efi          # UEFI GRUB bootloader
-│   ├── vmlinuz               # Linux kernel (from target distro)
-│   ├── initrd                # initramfs (from target distro)
+│   ├── grubx64.efi                           # UEFI GRUB bootloader
+│   ├── vmlinuz                               # Linux kernel (extracted from Ubuntu ISO)
+│   ├── initrd                                # initramfs (extracted from Ubuntu ISO)
 │   └── grub/
-│       └── grub.cfg          # GRUB boot menu
+│       └── grub.cfg                          # GRUB boot menu
 └── http/
-    └── <ISO or disk image>   # OS installer or disk image
+    ├── ubuntu-24.04.4-live-server-amd64.iso  # Ubuntu installer ISO (3.2 GB)
+    ├── almalinux.img                         # AlmaLinux raw disk image (10 GB, converted from QCOW2)
+    ├── AlmaLinux-9-latest-x86_64-boot.iso    # AlmaLinux network install ISO (not wired into GRUB)
+    └── AlmaLinux-9-latest-x86_64-minimal.iso # AlmaLinux minimal ISO (not wired into GRUB)
 ```
 
 ### Step-by-Step
@@ -180,22 +184,56 @@ dnsmasq-tftp: sent vmlinuz to 10.0.0.198
 dnsmasq-tftp: sent initrd to 10.0.0.198
 ```
 
-## Writing a Disk Image to Server
+## Two Installation Workflows
 
-If you have a pre-built disk image (e.g., `almalinux.img`), PXE boot a live Ubuntu, then:
+This project supports two distinct workflows:
+
+### Workflow 1: Ubuntu — PXE Boot the Installer (Recommended)
+
+The Ubuntu ISO (`ubuntu-24.04.4-live-server-amd64.iso`) is a **live server installer**. PXE booting it launches the standard Ubuntu installer (Subiquity), which properly partitions the disk, installs packages, and configures the bootloader on the target server. This is the normal, clean way to install an OS via PXE.
+
+The boot flow is:
+1. PXE boot → GRUB loads `vmlinuz` + `initrd` via TFTP
+2. Kernel boots, downloads the full ISO via HTTP
+3. Ubuntu installer launches — walk through it interactively (or provide an `autoinstall` config)
+4. Installer writes a proper installation to disk and reboots
+
+No `dd`, no raw images — just a standard network install.
+
+### Workflow 2: AlmaLinux — Clone a Pre-Built Disk Image
+
+AlmaLinux is handled differently because we have a **pre-built VM disk image** rather than a bootable installer ISO. The files are:
+
+| File | Format | Size | Description |
+|------|--------|------|-------------|
+| `AlmaLinux` (QCOW2) | QEMU QCOW2 v3 | 562 MB | Original VM disk image (sparse, compressed) |
+| `almalinux.img` (raw) | Raw MBR disk image | 10 GB | Converted from QCOW2, ready to write to physical disk |
+
+The QCOW2 is converted to raw format using:
 
 ```bash
-# From the PXE-booted Ubuntu shell on the target server:
+qemu-img convert -f qcow2 -O raw AlmaLinux almalinux.img
+```
 
+> **Why raw?** QCOW2 is a QEMU-specific format — you can't write it directly to a physical disk. The raw image is a byte-for-byte copy of the virtual disk that can be written with `dd`.
+
+To deploy it to a physical server:
+
+1. PXE boot the target into **Ubuntu 24.04 Live** (using Workflow 1's GRUB menu, but drop to a shell instead of running the installer)
+2. From the live Ubuntu shell on the target server:
+
+```bash
 # Find the target disk
 lsblk
 
-# Write the disk image over HTTP (10.0.0.1 = your Mac)
+# Stream the raw image from Mac and write to disk
 curl http://10.0.0.1:8080/almalinux.img | dd of=/dev/sda bs=4M status=progress
 
-# Reboot into the new OS
+# Reboot into AlmaLinux
 reboot
 ```
+
+> **Note:** The AlmaLinux boot/minimal ISOs (`AlmaLinux-9-latest-x86_64-boot.iso`, `AlmaLinux-9-latest-x86_64-minimal.iso`) in `http/` are small network install ISOs. They are not currently wired into the GRUB menu. To PXE boot AlmaLinux's own installer, you would need to extract its `vmlinuz`/`initrd.img`, add a GRUB menu entry, and point `inst.repo` to an AlmaLinux mirror (see the example `grub.cfg` in section 4 above).
 
 ## Internet Sharing (Post-Install)
 
@@ -244,4 +282,4 @@ sudo ./go-pxe \
 2. **macOS broadcast routing**: Outbound UDP broadcasts go through the default-route interface (Wi-Fi), not necessarily the Ethernet. Use `IP_BOUND_IF` or dnsmasq's `--bind-interfaces` to pin to the correct interface.
 3. **BOOTP minimum packet size**: Some PXE ROMs reject DHCP packets smaller than 548 bytes.
 4. **DHCP source port**: PXE ROMs reject replies not from port 67.
-5. **Pre-installed disk images are not PXE-bootable**: An `.img` file of an installed OS cannot be PXE booted directly. PXE boot a live OS first, then `dd` the image to disk.
+5. **Pre-built disk images (QCOW2/raw) are not PXE-bootable**: A VM disk image cannot be PXE booted directly. Convert QCOW2 to raw (`qemu-img convert -f qcow2 -O raw`), PXE boot a live Ubuntu, then `curl | dd` the raw image to the target disk. This is a workaround for deploying a pre-built OS — proper PXE installation (like the Ubuntu workflow) is preferred when an installer ISO is available.
