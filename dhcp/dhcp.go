@@ -251,17 +251,15 @@ func (s *Server) sendReply(conn *net.UDPConn, req *Packet, msgType byte, clientI
 
 	data := serializePacket(reply)
 
-	// Send as broadcast on port 68
-	// Use the broadcast flag from client, or always broadcast for PXE
+	// Send as global broadcast (255.255.255.255:68).
+	// PXE ROMs (especially HP UEFI) filter on IP destination and reject
+	// subnet-directed broadcasts like 10.0.0.255 — they only accept 255.255.255.255.
 	dst := &net.UDPAddr{IP: net.IPv4bcast, Port: 68}
-
-	// On macOS, sending to 255.255.255.255 may not work on all interfaces.
-	// Use the subnet broadcast address instead for reliability.
-	subnetBcast := &net.UDPAddr{IP: subnet, Port: 68}
-	if _, err := conn.WriteToUDP(data, subnetBcast); err != nil {
-		// Fallback to global broadcast
-		log.Printf("[DHCP] Subnet broadcast failed (%v), trying global broadcast", err)
-		if _, err := conn.WriteToUDP(data, dst); err != nil {
+	if _, err := conn.WriteToUDP(data, dst); err != nil {
+		// Fallback to subnet broadcast
+		subnetBcast := &net.UDPAddr{IP: subnet, Port: 68}
+		log.Printf("[DHCP] Global broadcast failed (%v), trying subnet broadcast", err)
+		if _, err := conn.WriteToUDP(data, subnetBcast); err != nil {
 			log.Printf("[DHCP] Send error: %v", err)
 		}
 	}

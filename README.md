@@ -1,239 +1,159 @@
 # Go PXE Boot Server
 
-Self-contained PXE boot server for macOS: DHCP + TFTP + HTTP in a single binary.
+Self-contained PXE boot server for macOS: DHCP + TFTP + HTTP in a single binary. Tested and working with HPE Gen9 UEFI PXE boot.
 
-> **Note:** The Go DHCP implementation has a known issue with HPE Gen9 (and possibly other) UEFI PXE ROMs that reject its OFFER packets. Use **dnsmasq** for production PXE boots (see below). The Go binary is useful for environments where dnsmasq is not available.
-
-## What Actually Works: dnsmasq + HTTP
-
-This is the tested, working method for PXE booting HPE Gen9 servers from macOS.
-
-### Prerequisites
+## Quick Start
 
 ```bash
-# Install dnsmasq (if not already installed)
-brew install dnsmasq
-
-# Python 3 (for HTTP server, comes with macOS)
-python3 --version
+cd go-pxe
+go build -o go-pxe .
+sudo ./go-pxe \
+  -iface en7 \
+  -ip 10.0.0.1 \
+  -dhcp-start 10.0.0.100 \
+  -dhcp-end 10.0.0.200 \
+  -tftp-root ../tftp \
+  -http-root ../http \
+  -http-port 8080 \
+  -boot-file grubx64.efi
 ```
 
-### Directory Structure
+## Directory Structure
 
 ```
 pxeboot/
-├── dnsmasq.conf                              # Production DHCP/TFTP config
+├── dnsmasq.conf                              # Alternative dnsmasq config (if not using go-pxe)
+├── go-pxe/                                   # This Go project (DHCP + TFTP + HTTP)
 ├── tftp/
 │   ├── grubx64.efi                           # UEFI GRUB bootloader
-│   ├── vmlinuz                               # Linux kernel (extracted from Ubuntu ISO)
-│   ├── initrd                                # initramfs (extracted from Ubuntu ISO)
+│   ├── vmlinuz                               # Linux kernel (from AlmaLinux or Ubuntu ISO)
+│   ├── initrd.img                            # AlmaLinux initramfs
+│   ├── initrd                                # Ubuntu initramfs
 │   └── grub/
-│       └── grub.cfg                          # GRUB boot menu
+│       └── grub.cfg                          # GRUB boot menu (multi-OS)
 └── http/
-    ├── ubuntu-24.04.4-live-server-amd64.iso  # Ubuntu installer ISO (3.2 GB)
-    ├── almalinux.img                         # AlmaLinux raw disk image (10 GB, converted from QCOW2)
-    ├── AlmaLinux-9-latest-x86_64-boot.iso    # AlmaLinux network install ISO (not wired into GRUB)
-    └── AlmaLinux-9-latest-x86_64-minimal.iso # AlmaLinux minimal ISO (not wired into GRUB)
-```
-
-### Step-by-Step
-
-#### 1. Connect Hardware
-
-- Connect Mac to target server via Ethernet (direct cable or same switch)
-- Identify your Ethernet interface:
-
-```bash
-networksetup -listallhardwareports
-# Look for "Thunderbolt Ethernet" or "USB 10/100/1000 LAN" — note the Device (e.g., en7)
-```
-
-#### 2. Set Static IP on Ethernet Interface
-
-```bash
-sudo ifconfig en7 10.0.0.1 netmask 255.255.255.0 up
-# Verify:
-ifconfig en7 | grep inet
-# Should show: inet 10.0.0.1 netmask 0xffffff00 broadcast 10.0.0.255
-```
-
-#### 3. Prepare Boot Assets
-
-**For Ubuntu 24.04:**
-
-```bash
-cd /path/to/pxeboot
-
-# Download ISO (if not already present)
-curl -LO https://releases.ubuntu.com/24.04.4/ubuntu-24.04.4-live-server-amd64.iso
-mv ubuntu-24.04.4-live-server-amd64.iso http/
-
-# Extract kernel and initrd from ISO
-mkdir -p /tmp/ubuntu-mount
-hdiutil attach http/ubuntu-24.04.4-live-server-amd64.iso -mountpoint /tmp/ubuntu-mount
-cp /tmp/ubuntu-mount/casper/vmlinuz tftp/vmlinuz
-cp /tmp/ubuntu-mount/casper/initrd tftp/initrd
-hdiutil detach /tmp/ubuntu-mount
-```
-
-**For AlmaLinux/RHEL (boot ISO):**
-
-```bash
-curl -LO https://repo.almalinux.org/almalinux/9/isos/x86_64/AlmaLinux-9-latest-x86_64-boot.iso
-mv AlmaLinux-9-latest-x86_64-boot.iso http/
-
-mkdir -p /tmp/alma-mount
-hdiutil attach http/AlmaLinux-9-latest-x86_64-boot.iso -mountpoint /tmp/alma-mount
-cp /tmp/alma-mount/images/pxeboot/vmlinuz tftp/vmlinuz
-cp /tmp/alma-mount/images/pxeboot/initrd.img tftp/initrd
-hdiutil detach /tmp/alma-mount
-```
-
-**Get GRUB EFI bootloader** (if not already present):
-
-```bash
-# From an existing Ubuntu system, or extract from the ISO:
-# The grubx64.efi in this repo should work for most UEFI systems.
-ls tftp/grubx64.efi
-```
-
-#### 4. Configure GRUB Menu
-
-Edit `tftp/grub/grub.cfg`:
-
-**For Ubuntu live/rescue shell:**
-```
-set timeout=30
-set default=0
-
-menuentry "Ubuntu 24.04 Live" {
-    linux vmlinuz ip=dhcp url=http://10.0.0.1:8080/ubuntu-24.04.4-live-server-amd64.iso
-    initrd initrd
-}
-
-menuentry "Boot from local disk" {
-    exit
-}
-```
-
-**For AlmaLinux network install:**
-```
-set timeout=30
-set default=0
-
-menuentry "Install AlmaLinux 9" {
-    linux vmlinuz ip=dhcp inst.repo=https://repo.almalinux.org/almalinux/9/BaseOS/x86_64/os/
-    initrd initrd
-}
-
-menuentry "Boot from local disk" {
-    exit
-}
-```
-
-#### 5. Start HTTP Server
-
-```bash
-cd /path/to/pxeboot/http
-python3 -m http.server 8080 &
-```
-
-#### 6. Start dnsmasq (PXE DHCP + TFTP)
-
-```bash
-sudo dnsmasq \
-  --no-daemon \
-  --interface=en7 \
-  --bind-interfaces \
-  --dhcp-range=10.0.0.100,10.0.0.200,255.255.255.0,1h \
-  --dhcp-option=option:router,10.0.0.1 \
-  --dhcp-boot=grubx64.efi \
-  --dhcp-match=set:efi-x86_64,option:client-arch,7 \
-  --dhcp-match=set:efi-x86_64,option:client-arch,9 \
-  --dhcp-boot=tag:efi-x86_64,grubx64.efi \
-  --enable-tftp \
-  --tftp-root=/path/to/pxeboot/tftp \
-  --log-dhcp \
-  --log-queries
-```
-
-> Replace `en7` with your Ethernet interface and paths accordingly.
-
-#### 7. Boot the Target Server
-
-1. Power on the server
-2. Press **F12** (or F11) for the boot menu
-3. Select **Network Boot** / **PXE** (UEFI mode)
-4. The server will:
-   - DHCP → get IP from dnsmasq
-   - TFTP → download `grubx64.efi`
-   - GRUB → load `grub.cfg`, show boot menu
-   - Download `vmlinuz` + `initrd` via TFTP
-   - Boot the kernel, which downloads the ISO via HTTP
-
-### Expected dnsmasq Log Output
-
-```
-dnsmasq-dhcp: DHCPDISCOVER(en7) 20:67:7c:e5:54:ec
-dnsmasq-dhcp: DHCPOFFER(en7) 10.0.0.198 20:67:7c:e5:54:ec
-dnsmasq-dhcp: DHCPREQUEST(en7) 10.0.0.198 20:67:7c:e5:54:ec
-dnsmasq-dhcp: DHCPACK(en7) 10.0.0.198 20:67:7c:e5:54:ec
-dnsmasq-tftp: sent grubx64.efi to 10.0.0.198
-dnsmasq-tftp: sent grub/grub.cfg to 10.0.0.198
-dnsmasq-tftp: sent vmlinuz to 10.0.0.198
-dnsmasq-tftp: sent initrd to 10.0.0.198
+    ├── almalinux97/                          # Extracted AlmaLinux 9.7 DVD (repo for Anaconda)
+    ├── AlmaLinux-9.7-x86_64-dvd.iso          # AlmaLinux DVD ISO (12 GB)
+    ├── ubuntu-24.04.4-live-server-amd64.iso  # Ubuntu live server ISO (3.2 GB)
+    └── almalinux.img                         # AlmaLinux raw disk image (10 GB, for dd workflow)
 ```
 
 ## Two Installation Workflows
 
-This project supports two distinct workflows:
+### Workflow 1: AlmaLinux — Anaconda Installer (Recommended)
 
-### Workflow 1: Ubuntu — PXE Boot the Installer (Recommended)
+PXE boots directly into the AlmaLinux Anaconda installer GUI. You walk through disk partitioning, user setup, and package selection interactively.
 
-The Ubuntu ISO (`ubuntu-24.04.4-live-server-amd64.iso`) is a **live server installer**. PXE booting it launches the standard Ubuntu installer (Subiquity), which properly partitions the disk, installs packages, and configures the bootloader on the target server. This is the normal, clean way to install an OS via PXE.
-
-The boot flow is:
-1. PXE boot → GRUB loads `vmlinuz` + `initrd` via TFTP
-2. Kernel boots, downloads the full ISO via HTTP
-3. Ubuntu installer launches — walk through it interactively (or provide an `autoinstall` config)
-4. Installer writes a proper installation to disk and reboots
-
-No `dd`, no raw images — just a standard network install.
-
-### Workflow 2: AlmaLinux — Clone a Pre-Built Disk Image
-
-AlmaLinux is handled differently because we have a **pre-built VM disk image** rather than a bootable installer ISO. The files are:
-
-| File | Format | Size | Description |
-|------|--------|------|-------------|
-| `AlmaLinux` (QCOW2) | QEMU QCOW2 v3 | 562 MB | Original VM disk image (sparse, compressed) |
-| `almalinux.img` (raw) | Raw MBR disk image | 10 GB | Converted from QCOW2, ready to write to physical disk |
-
-The QCOW2 is converted to raw format using:
+**Setup:**
 
 ```bash
-qemu-img convert -f qcow2 -O raw AlmaLinux almalinux.img
+# Download AlmaLinux DVD ISO
+# Iranian mirrors: https://mirror.0-1.ir/almalinux/9/isos/x86_64/
+# Official: https://repo.almalinux.org/almalinux/9/isos/x86_64/
+curl -LO https://repo.almalinux.org/almalinux/9/isos/x86_64/AlmaLinux-9.7-x86_64-dvd.iso
+mv AlmaLinux-9.7-x86_64-dvd.iso http/
+
+# Extract PXE boot files (vmlinuz + initrd.img)
+7z e http/AlmaLinux-9.7-x86_64-dvd.iso images/pxeboot/vmlinuz images/pxeboot/initrd.img -otftp/ -y
+
+# Extract ISO contents for HTTP repo (Anaconda needs directory structure, not raw ISO)
+mkdir -p http/almalinux97
+cd http/almalinux97 && 7z x ../AlmaLinux-9.7-x86_64-dvd.iso -y
 ```
 
-> **Why raw?** QCOW2 is a QEMU-specific format — you can't write it directly to a physical disk. The raw image is a byte-for-byte copy of the virtual disk that can be written with `dd`.
+**GRUB config (`tftp/grub/grub.cfg`):**
+```
+menuentry "Install AlmaLinux 9.7 (Anaconda)" {
+    linux vmlinuz ip=dhcp inst.repo=http://10.0.0.1:8080/almalinux97/
+    initrd initrd.img
+}
+```
 
-To deploy it to a physical server:
+> **Important:** `inst.repo` must point to the extracted directory (containing `.treeinfo`), NOT to the raw ISO file. Anaconda cannot fetch a repo from an ISO URL over HTTP.
 
-1. PXE boot the target into **Ubuntu 24.04 Live** (using Workflow 1's GRUB menu, but drop to a shell instead of running the installer)
-2. From the live Ubuntu shell on the target server:
+**Boot flow:**
+1. PXE → GRUB loads AlmaLinux `vmlinuz` + `initrd.img` via TFTP
+2. Kernel boots, Anaconda fetches repo from `http://10.0.0.1:8080/almalinux97/`
+3. Anaconda GUI launches — configure disk, users, packages interactively
+4. Installer writes AlmaLinux to disk and reboots
+
+### Workflow 2: Ubuntu — Live Boot (for dd deploy or rescue)
+
+PXE boots Ubuntu 24.04 live server. Use this either for a standard Ubuntu install, as a rescue shell, or to `dd` a raw disk image (like `almalinux.img`) to the target.
+
+**Setup:**
 
 ```bash
-# Find the target disk
-lsblk
+# Download Ubuntu ISO
+curl -LO https://releases.ubuntu.com/24.04.4/ubuntu-24.04.4-live-server-amd64.iso
+mv ubuntu-24.04.4-live-server-amd64.iso http/
 
-# Stream the raw image from Mac and write to disk
+# Extract kernel/initrd from ISO
+7z e http/ubuntu-24.04.4-live-server-amd64.iso casper/vmlinuz casper/initrd -otftp/ -y
+# Rename: casper/vmlinuz -> vmlinuz, casper/initrd -> initrd (already in tftp/)
+```
+
+**GRUB config:**
+```
+menuentry "Ubuntu 24.04 Live (for dd deploy or rescue)" {
+    linux vmlinuz ip=dhcp url=http://10.0.0.1:8080/ubuntu-24.04.4-live-server-amd64.iso
+    initrd initrd
+}
+```
+
+**dd workflow (to deploy pre-built AlmaLinux disk image):**
+```bash
+# From the live Ubuntu shell on the target server:
 curl http://10.0.0.1:8080/almalinux.img | dd of=/dev/sda bs=4M status=progress
-
-# Reboot into AlmaLinux
 reboot
 ```
 
-> **Note:** The AlmaLinux boot/minimal ISOs (`AlmaLinux-9-latest-x86_64-boot.iso`, `AlmaLinux-9-latest-x86_64-minimal.iso`) in `http/` are small network install ISOs. They are not currently wired into the GRUB menu. To PXE boot AlmaLinux's own installer, you would need to extract its `vmlinuz`/`initrd.img`, add a GRUB menu entry, and point `inst.repo` to an AlmaLinux mirror (see the example `grub.cfg` in section 4 above).
+## Hardware Setup
+
+1. Connect Mac to target server via Ethernet (USB-C/Thunderbolt adapter → direct cable)
+2. Set static IP on the Ethernet interface:
+
+```bash
+# Find your interface (look for USB/Thunderbolt Ethernet)
+networksetup -listallhardwareports
+
+# Set static IP
+sudo ifconfig en7 10.0.0.1 netmask 255.255.255.0 up
+```
+
+3. Boot target server, select PXE IPv4 (UEFI mode) from boot menu (F12/F11)
+
+## Key Fixes (HPE Gen9 Compatibility)
+
+### DHCP: Global broadcast for OFFER/ACK
+
+HPE Gen9 UEFI PXE ROMs filter on IP destination and **reject subnet-directed broadcasts** (e.g., `10.0.0.255`). They only accept packets addressed to `255.255.255.255`.
+
+**Fix:** Send DHCP replies to `255.255.255.255:68` (global broadcast) instead of subnet broadcast. Fall back to subnet broadcast only if global fails.
+
+### TFTP: Option negotiation (RFC 2347)
+
+HP UEFI PXE clients request `blksize` and `tsize` options in TFTP RRQ. Without an OACK response, the client either aborts or falls back to 512-byte blocks (causing 2.3MB `grubx64.efi` to transfer extremely slowly or time out).
+
+**Fix:** Implement OACK responses supporting:
+- `blksize` — negotiate up to 1468 bytes (Ethernet MTU - headers)
+- `tsize` — report file size before transfer
+
+This reduced `grubx64.efi` transfer from timing out to completing in <1 second.
+
+## Alternative: dnsmasq
+
+If you prefer dnsmasq over the Go binary:
+
+```bash
+# Start dnsmasq (DHCP + TFTP)
+sudo dnsmasq --no-daemon --conf-file=../dnsmasq.conf
+
+# Start HTTP server separately
+cd ../http && python3 -m http.server 8080
+```
+
+> **Note:** On macOS, dnsmasq with `bind-interfaces` can get stuck at 100% CPU on some setups. The go-pxe binary avoids this issue entirely.
 
 ## Internet Sharing (Post-Install)
 
@@ -251,35 +171,19 @@ echo "nat on en0 from 10.0.0.0/24 to any -> (en0)" | sudo pfctl -ef -
 
 | Problem | Solution |
 |---------|----------|
-| DISCOVER loops (no REQUEST) | Use dnsmasq instead of go-pxe. HPE UEFI PXE ROMs are strict about DHCP packet format. |
-| TFTP "User aborted" then succeeds | Normal — PXE ROM retries on first TFTP error. |
-| GRUB shows "file not found" for `.lst` files | Non-fatal. GRUB modules `command.lst`, `fs.lst`, etc. are optional. |
-| Server doesn't PXE boot | Check BIOS: must be UEFI mode, network boot enabled. |
-| "No bootable device" | Verify Ethernet link is up: `ifconfig en7` should show `RUNNING`. |
-| TFTP timeout | Check macOS firewall is disabled: `sudo /usr/libexec/ApplicationFirewall/socketfilterfw --getglobalstate` |
-
-## Go PXE Binary (Experimental)
-
-The Go binary (`go-pxe`) combines DHCP + TFTP + HTTP but has a known DHCP compatibility issue with strict PXE ROMs. It works with some clients but not HPE Gen9 UEFI.
-
-```bash
-cd go-pxe
-go build -o go-pxe .
-sudo ./go-pxe \
-  -iface en7 \
-  -ip 10.0.0.1 \
-  -dhcp-start 10.0.0.100 \
-  -dhcp-end 10.0.0.200 \
-  -tftp-root ../tftp \
-  -http-root ../http \
-  -http-port 8080 \
-  -boot-file grubx64.efi
-```
+| DISCOVER loops (no REQUEST) | Ensure replies go to `255.255.255.255`, not subnet broadcast |
+| TFTP transfer never completes | Server must support `blksize`/`tsize` OACK negotiation |
+| Anaconda "failed to fetch" | `inst.repo` must point to extracted ISO directory, not raw ISO file |
+| GRUB shows "file not found" for `.lst` files | Non-fatal — GRUB modules `command.lst`, `fs.lst`, etc. are optional |
+| Server doesn't PXE boot | Check BIOS: must be UEFI mode, network boot enabled |
+| dnsmasq 100% CPU on macOS | Use go-pxe binary instead |
+| TFTP timeout on large files | Ensure `blksize` negotiation is working (check for OACK in logs) |
 
 ## Lessons Learned
 
-1. **HPE Gen9 UEFI PXE is extremely strict** about DHCP packet format. dnsmasq handles all the edge cases.
-2. **macOS broadcast routing**: Outbound UDP broadcasts go through the default-route interface (Wi-Fi), not necessarily the Ethernet. Use `IP_BOUND_IF` or dnsmasq's `--bind-interfaces` to pin to the correct interface.
-3. **BOOTP minimum packet size**: Some PXE ROMs reject DHCP packets smaller than 548 bytes.
-4. **DHCP source port**: PXE ROMs reject replies not from port 67.
-5. **Pre-built disk images (QCOW2/raw) are not PXE-bootable**: A VM disk image cannot be PXE booted directly. Convert QCOW2 to raw (`qemu-img convert -f qcow2 -O raw`), PXE boot a live Ubuntu, then `curl | dd` the raw image to the target disk. This is a workaround for deploying a pre-built OS — proper PXE installation (like the Ubuntu workflow) is preferred when an installer ISO is available.
+1. **PXE ROMs filter on IP destination**: HP UEFI only accepts `255.255.255.255` broadcast, not subnet-directed `10.0.0.255` — even though both arrive as ethernet broadcast frames.
+2. **TFTP option negotiation is mandatory for UEFI**: Modern PXE clients request `blksize`/`tsize`. Without OACK support, large file transfers fail.
+3. **Anaconda needs a repo directory, not an ISO URL**: `inst.repo=http://server/file.iso` does not work. Extract the ISO and serve the directory structure (must contain `.treeinfo`).
+4. **macOS broadcast routing**: Use `IP_BOUND_IF` to pin UDP sockets to the correct interface.
+5. **BOOTP minimum packet size**: Some PXE ROMs reject DHCP packets smaller than 548 bytes.
+6. **dnsmasq on macOS is unreliable**: With `bind-interfaces` it can spin at 100% CPU. The Go binary is more predictable.
