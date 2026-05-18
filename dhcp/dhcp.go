@@ -173,12 +173,34 @@ func (s *Server) ListenAndServe() error {
 			continue
 		}
 
+		// Log PXE-specific options for diagnostics
+		isPXE := false
+		if vc, ok := pkt.Options[60]; ok {
+			log.Printf("[DHCP] Vendor Class (opt60): %q from %s", string(vc), pkt.CHAddr)
+			if len(vc) >= 9 && string(vc[:9]) == "PXEClient" {
+				isPXE = true
+			}
+		}
+		if arch, ok := pkt.Options[OptClientArch]; ok {
+			if len(arch) >= 2 {
+				archVal := binary.BigEndian.Uint16(arch)
+				log.Printf("[DHCP] Client Arch (opt93): %d from %s", archVal, pkt.CHAddr)
+			}
+		}
+		if uuid, ok := pkt.Options[97]; ok {
+			log.Printf("[DHCP] Client UUID (opt97): %x from %s", uuid, pkt.CHAddr)
+		}
+
 		switch msgType[0] {
 		case DISCOVER:
-			log.Printf("[DHCP] DISCOVER from %s", pkt.CHAddr)
+			if isPXE {
+				log.Printf("[DHCP] >>> PXE DISCOVER from %s <<<", pkt.CHAddr)
+			} else {
+				log.Printf("[DHCP] DISCOVER from %s (non-PXE)", pkt.CHAddr)
+			}
 			s.sendOffer(conn, pkt, remote)
 		case REQUEST:
-			log.Printf("[DHCP] REQUEST from %s", pkt.CHAddr)
+			log.Printf("[DHCP] REQUEST from %s (PXE=%v)", pkt.CHAddr, isPXE)
 			s.sendACK(conn, pkt, remote)
 		default:
 			log.Printf("[DHCP] Type %d from %s", msgType[0], pkt.CHAddr)
